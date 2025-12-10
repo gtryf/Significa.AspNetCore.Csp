@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Options;
 using System.Text;
+using System.Linq;
 
 namespace Significa.AspNetCore.Csp.Middleware
 {
@@ -24,40 +25,64 @@ namespace Significa.AspNetCore.Csp.Middleware
                 return;
             }
 
-            if (!ShouldProcessResponse(context.Response))
-            {
-                await _next(context);
-                return;
-            }
-
-            // Intercept the response to inject the nonce into index.html
+            // Intercept the response so we can evaluate headers AFTER downstream has run
             var originalBodyStream = context.Response.Body;
-            using (var memoryStream = new MemoryStream())
-            {
-                // Redirect the response body to the memory stream
-                context.Response.Body = memoryStream;
+            using var memoryStream = new MemoryStream();
+            context.Response.Body = memoryStream;
 
-                // Call the next middleware in the pipeline
+            try
+            {
+                // Run the rest of the pipeline
                 await _next(context);
 
-                // Reset the memory stream position to read the response
+                // Rewind the captured response
                 memoryStream.Seek(0, SeekOrigin.Begin);
+
+                // Only process html responses after downstream has set headers
+                if (!IsHtmlResponse(context.Response.ContentType))
+                {
+                    await memoryStream.CopyToAsync(originalBodyStream);
+                    return;
+                }
+
+                // If server sent 304/204, avoid serving cached HTML with stale nonce; force no-cache going forward
+                if (context.Response.StatusCode == StatusCodes.Status304NotModified ||
+                    context.Response.StatusCode == StatusCodes.Status204NoContent)
+                {
+                    SetNoCacheHeaders(context.Response);
+                    await memoryStream.CopyToAsync(originalBodyStream);
+                    return;
+                }
 
                 // Detect the original encoding
                 var originalEncoding = DetectEncoding(context.Response.ContentType) ?? Encoding.UTF8;
-                using var reader = new StreamReader(memoryStream, originalEncoding);
+                using var reader = new StreamReader(memoryStream, originalEncoding, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
                 var originalResponseBody = await reader.ReadToEndAsync();
 
-                // Replace the placeholder in index.html with the nonce
+                // Replace the placeholder with the nonce
                 var newResponseBody = originalResponseBody.Replace(_noncePlaceholder, nonce);
 
-                // Set the new response body
+                // Write the updated response and ensure it won't be cached (nonce is per-request)
                 var newResponseBytes = originalEncoding.GetBytes(newResponseBody);
                 context.Response.Body = originalBodyStream;
                 context.Response.ContentLength = newResponseBytes.Length;
-                context.Response.ContentType = "text/html"; // Set the appropriate content type
+                SetNoCacheHeaders(context.Response);
                 await context.Response.Body.WriteAsync(newResponseBytes, 0, newResponseBytes.Length);
             }
+            finally
+            {
+                // Ensure the response body stream is restored
+                context.Response.Body = originalBodyStream;
+            }
+        }
+
+        private static void SetNoCacheHeaders(HttpResponse response)
+        {
+            response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+            response.Headers["Pragma"] = "no-cache";
+            response.Headers["Expires"] = "0";
+            response.Headers.Remove("ETag");
+            response.Headers.Remove("Last-Modified");
         }
 
         private Encoding DetectEncoding(string contentType)
@@ -89,10 +114,5 @@ namespace Significa.AspNetCore.Csp.Middleware
 
         private bool IsHtmlResponse(string contentType)
             => contentType != null && contentType.Contains("text/html", StringComparison.OrdinalIgnoreCase);
-
-        private bool ShouldProcessResponse(HttpResponse response) =>
-            IsHtmlResponse(response.ContentType) &&
-            response.StatusCode != StatusCodes.Status304NotModified &&
-            response.StatusCode != StatusCodes.Status204NoContent;
     }
 }
