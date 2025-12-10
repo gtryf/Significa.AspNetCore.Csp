@@ -6,7 +6,7 @@
 		<Nullable>enable</Nullable>
 
 		<PackageId>Significa.AspNetCore.Csp</PackageId>
-		<Version>1.0.3</Version>
+		<Version>1.0.4</Version>
 		<Authors>Significa</Authors>
 		<Company>Significa</Company>
 		<Description>Middleware to handle Content-Security-Policy header generation</Description>
